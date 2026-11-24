@@ -40,7 +40,7 @@ jobs:
             -H "Title: Build started: ${{ github.repository }}" \
             -H "Tags: hammer_and_wrench" \
             -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -d "Build started for commit ${GITHUB_SHA::7} on ${{ github.ref_name }}. Release tag: ${{ steps.t.outputs.tag }}" \
+            -d "Build currently started for commit ${GITHUB_SHA::7} on ${{ github.ref_name }}. Release tag: ${{ steps.t.outputs.tag }}" \
             "$NTFY_URL" || true
 
   # ------------------------------------------------------------------ build
