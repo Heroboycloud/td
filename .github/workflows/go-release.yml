@@ -1,0 +1,206 @@
+# Save as: .github/workflows/release.yml
+name: Build & Release Go Binaries
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NTFY_URL: https://ntfy.sh/az_alerts
+
+jobs:
+  # ---------------------------------------------------------------- prepare
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+      app: ${{ steps.t.outputs.app }}
+    steps:
+      - id: t
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="build-${{ github.run_number }}"
+          fi
+          NAME="${{ github.event.repository.name }}"
+          APP="${NAME//[^A-Za-z0-9._-]/-}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Notify start
+        continue-on-error: true
+        run: |
+          curl -fsS --max-time 15 \
+            -H "Title: Build started: ${{ github.repository }}" \
+            -H "Tags: hammer_and_wrench" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "Build started for commit ${GITHUB_SHA::7} on ${{ github.ref_name }}. Release tag: ${{ steps.t.outputs.tag }}" \
+            "$NTFY_URL" || true
+
+  # ------------------------------------------------------------------ build
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # one failing target never cancels the others
+      matrix:
+        include:
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            ext: .exe
+          - name: termux-aarch64
+            goos: linux
+            goarch: arm64
+            ext: ""
+          - name: wsl-ubuntu-amd64
+            goos: linux
+            goarch: amd64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        continue-on-error: true
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Build ${{ matrix.name }}
+        id: build
+        continue-on-error: true
+        env:
+          APP: ${{ needs.prepare.outputs.app }}
+          CGO_ENABLED: "0" # fully static: runs on any device, no libc needed
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          [ -f go.mod ] || go mod init "github.com/${{ github.repository }}"
+          go mod tidy || true
+
+          # Find the main package (root first, otherwise first "main" found)
+          PKG="."
+          ROOT_NAME="$(go list -f '{{.Name}}' . 2>/dev/null || true)"
+          if [ "$ROOT_NAME" != "main" ]; then
+            ALL_MAINS="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>/dev/null || true)"
+            ALL_MAINS="$(echo "$ALL_MAINS" | sed '/^$/d')"
+            PKG="${ALL_MAINS%%$'\n'*}"
+          fi
+          [ -n "$PKG" ] || { echo "No main package found"; exit 1; }
+          echo "Building package: $PKG"
+
+          mkdir -p dist
+          OUT="${APP}-${{ matrix.name }}${{ matrix.ext }}"
+          go build -trimpath -ldflags "-s -w" -o "dist/$OUT" "$PKG"
+          ls -lh dist
+          file "dist/$OUT" || true
+
+          # Linux/Termux: tar.gz keeps the executable bit when downloaded
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            chmod +x "dist/$OUT"
+            tar -C dist -czf "dist/$OUT.tar.gz" "$OUT"
+            rm "dist/$OUT"
+          fi
+
+      - name: Upload artifact
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Notify result
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.build.outcome }}" = "success" ]; then
+            T="Built OK: ${{ matrix.name }}"; TAGS="white_check_mark"
+          else
+            T="Build FAILED (skipped): ${{ matrix.name }}"; TAGS="x"
+          fi
+          curl -fsS --max-time 15 \
+            -H "Title: $T" -H "Tags: $TAGS" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "${{ github.repository }} @ ${GITHUB_SHA::7}" \
+            "$NTFY_URL" || true
+
+  # ---------------------------------------------------------------- release
+  release:
+    needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built binaries
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Collect files
+        id: files
+        run: |
+          mkdir -p dist
+          cd dist
+          COUNT=$(ls -1 | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -gt 0 ]; then sha256sum * > checksums.txt; fi
+          ls -lh
+
+      - name: Publish release
+        id: rel
+        if: steps.files.outputs.count != '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: dist/*
+          body: |
+            ## Downloads
+            - **Windows x64**: `*-windows-amd64.exe`
+            - **Android Termux (aarch64)**: `*-termux-aarch64.tar.gz`
+            - **Ubuntu WSL / Linux x64**: `*-wsl-ubuntu-amd64.tar.gz`
+
+            Linux/Termux: `tar -xzf <file>.tar.gz && ./<name>`
+
+      - name: Notify final result
+        if: always()
+        continue-on-error: true
+        run: |
+          BASE="${{ github.server_url }}/${{ github.repository }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          APP="${{ needs.prepare.outputs.app }}"
+          if [ "${{ steps.files.outputs.count }}" = "0" ] || [ "${{ steps.files.outputs.count }}" = "" ]; then
+            curl -fsS --max-time 15 -H "Title: Release FAILED" -H "Tags: rotating_light" \
+              -H "Click: $BASE/actions/runs/${{ github.run_id }}" \
+              -d "No binaries were built for ${{ github.repository }}. Check the logs." "$NTFY_URL" || true
+            exit 0
+          fi
+          MSG="Release $TAG is live!"$'\n'"Page: $BASE/releases/tag/$TAG"
+          for f in dist/*; do
+            n=$(basename "$f")
+            [ "$n" = "checksums.txt" ] && continue
+            MSG="$MSG"$'\n'"- $n: $BASE/releases/download/$TAG/$n"
+          done
+          curl -fsS --max-time 15 \
+            -H "Title: Release ready: ${{ github.repository }}" \
+            -H "Tags: rocket,tada" \
+            -H "Click: $BASE/releases/tag/$TAG" \
+            -H "Actions: view, Open release, $BASE/releases/tag/$TAG" \
+            -d "$MSG" "$NTFY_URL" || true
