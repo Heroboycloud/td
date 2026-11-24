@@ -1,0 +1,410 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+  actions: read
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.0'
+          cache: true
+
+      - name: Run tests
+        run: |
+          go vet ./...
+          go test -v ./...
+
+  build:
+    needs: test
+    name: Build - ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: amd64
+            binary: td
+            archive: tar.gz
+          - os: ubuntu-latest
+            platform: linux
+            arch: arm64
+            binary: td
+            archive: tar.gz
+          - os: macos-latest
+            platform: darwin
+            arch: amd64
+            binary: td
+            archive: tar.gz
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+            binary: td
+            archive: tar.gz
+          - os: windows-latest
+            platform: windows
+            arch: amd64
+            binary: td.exe
+            archive: zip
+          - os: windows-latest
+            platform: windows
+            arch: arm64
+            binary: td.exe
+            archive: zip
+      fail-fast: false
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Version
+        id: get_version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+          echo "date=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.5'
+          cache: true
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.platform }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+          VERSION: ${{ steps.get_version.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          DATE: ${{ steps.get_version.outputs.date }}
+        shell: bash
+        run: |
+          COMMIT_SHORT=${COMMIT:0:7}
+          echo "Building with version=$VERSION commit=$COMMIT_SHORT date=$DATE"  # Debug output
+          go build -trimpath -ldflags="-s -w -X 'main.version=$VERSION' -X 'main.commit=$COMMIT_SHORT' -X 'main.date=$DATE'" -o ${{ matrix.binary }} ./cmd/td
+
+      - name: Prepare Release Files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp ${{ matrix.binary }} release/
+          cp LICENSE release/
+          cp README.md release/
+          cd release
+          if [[ "${{ matrix.archive }}" == "tar.gz" ]]; then
+            tar czf ../td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }} *
+          else
+            powershell -Command "Compress-Archive -Path * -DestinationPath ../td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }}"
+          fi
+          cd ..
+          
+          # Create checksum file
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            powershell -Command "(Get-FileHash td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }} -Algorithm SHA256).Hash.ToLower() + '  ' + 'td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }}'" > td_${{ matrix.platform }}_${{ matrix.arch }}.sha256
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            shasum -a 256 td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }} > td_${{ matrix.platform }}_${{ matrix.arch }}.sha256
+          else
+            sha256sum td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }} > td_${{ matrix.platform }}_${{ matrix.arch }}.sha256
+          fi
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: td-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            td_${{ matrix.platform }}_${{ matrix.arch }}.${{ matrix.archive }}
+            td_${{ matrix.platform }}_${{ matrix.arch }}.sha256
+
+      - name: Upload Install Script
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-script-${{ matrix.arch }}
+          path: install.ps1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v5
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: ${{ needs.build.outputs.version }}
+          files: td-*/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    needs: [build, release]  # Need both to get version and ensure release exists
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: voioo/homebrew-tap
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Update Homebrew Formula
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          mkdir -p Formula
+          
+          # Get SHA256 for macOS Intel build
+          SHA256_INTEL=$(curl -sL https://github.com/${{ github.repository }}/releases/download/${VERSION}/td_darwin_amd64.sha256 | awk '{print $1}')
+          SHA256_ARM64=$(curl -sL https://github.com/${{ github.repository }}/releases/download/${VERSION}/td_darwin_arm64.sha256 | awk '{print $1}')
+          
+          cat > Formula/td-tui.rb << EOF
+          class TdTui < Formula
+            desc "Simple task management TUI tool"
+            homepage "https://github.com/voioo/td"
+            version "${VERSION#v}"
+            
+            on_macos do
+              on_arm do
+                url "https://github.com/voioo/td/releases/download/${VERSION}/td_darwin_arm64.tar.gz"
+                sha256 "${SHA256_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/voioo/td/releases/download/${VERSION}/td_darwin_amd64.tar.gz"
+                sha256 "${SHA256_INTEL}"
+              end
+            end
+            
+            def install
+              bin.install "td"
+            end
+            
+            test do
+              system "#{bin}/td", "--version"
+            end
+          end
+          EOF
+          
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add Formula/td-tui.rb
+          git commit -m "td-tui ${VERSION}: Update formula"
+          git push
+
+  aur-publish:
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          pacman -Sy --noconfirm git openssh base-devel curl
+
+      - name: Setup SSH key for AUR
+        run: |
+          # Ensure we're working with the correct SSH directory
+          SSH_DIR="/root/.ssh"
+          mkdir -p "$SSH_DIR"
+          chmod 700 "$SSH_DIR"
+          
+          # Install SSH private key
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > "$SSH_DIR/id_ed25519"
+          chmod 600 "$SSH_DIR/id_ed25519"
+          
+          # Add current AUR host key 
+          # Using ssh-keyscan to get the current host key directly from AUR
+          echo "Fetching current AUR host key..."
+          ssh-keyscan aur.archlinux.org > "$SSH_DIR/known_hosts" 2>/dev/null
+          if [ ! -s "$SSH_DIR/known_hosts" ]; then
+            echo "ssh-keyscan failed, trying direct connection to get host key..."
+            # Alternative: accept the key by connecting once with StrictHostKeyChecking=no
+            echo "aur.archlinux.org" > "$SSH_DIR/temp_host"
+            ssh-keyscan -t ed25519 aur.archlinux.org >> "$SSH_DIR/known_hosts" 2>/dev/null || {
+              echo "Using updated AUR host key from official documentation..."
+              # This is the updated key - the old one was rotated
+              echo "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDoQZlV1X8Jy5HFWcLVOUEuKINKZsMQ2fXQ+2mC3y8Gz" > "$SSH_DIR/known_hosts"
+            }
+            rm -f "$SSH_DIR/temp_host"
+          fi
+          chmod 644 "$SSH_DIR/known_hosts"
+          
+          # Create SSH config
+          cat > "$SSH_DIR/config" << EOF
+          Host aur.archlinux.org
+            HostName aur.archlinux.org
+            IdentityFile $SSH_DIR/id_ed25519
+            User aur
+            Port 22
+            PreferredAuthentications publickey
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 60
+            ServerAliveCountMax 10
+            ConnectTimeout 30
+          EOF
+          chmod 600 "$SSH_DIR/config"
+          
+          # Verify the setup
+          echo "SSH setup completed successfully"
+          echo "Files created:"
+          ls -la "$SSH_DIR/"
+
+      - name: Update PKGBUILD
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          VERSION=${VERSION#v}
+          
+          echo "Using version: $VERSION"
+          
+          SHA256_AMD64=$(curl -sL https://github.com/${{ github.repository }}/releases/download/v${VERSION}/td_linux_amd64.sha256 | awk '{print $1}')
+          SHA256_ARM64=$(curl -sL https://github.com/${{ github.repository }}/releases/download/v${VERSION}/td_linux_arm64.sha256 | awk '{print $1}')
+          
+          cat > PKGBUILD << EOF
+          # Maintainer: Voislav V. <voyo@thelazysre.com>
+          pkgname=td-tui
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Simple task management TUI tool"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/voioo/td"
+          license=('0BSD')
+          provides=('td')
+          conflicts=('td')
+          
+          source_x86_64=("https://github.com/voioo/td/releases/download/v\${pkgver}/td_linux_amd64.tar.gz")
+          source_aarch64=("https://github.com/voioo/td/releases/download/v\${pkgver}/td_linux_arm64.tar.gz")
+          sha256sums_x86_64=('${SHA256_AMD64}')
+          sha256sums_aarch64=('${SHA256_ARM64}')
+          
+          package() {
+              install -Dm755 td "\${pkgdir}/usr/bin/td"
+              install -Dm644 LICENSE "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
+              install -Dm644 README.md "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
+          }
+          EOF
+
+      - name: Generate .SRCINFO
+        run: |
+          useradd builduser -m
+          chown -R builduser:builduser .
+          su builduser -c "makepkg --cleanbuild --printsrcinfo > .SRCINFO"
+
+      - name: Debug SSH setup
+        run: |
+          echo "=== SSH Debug Information ==="
+          echo "SSH config:"
+          cat /root/.ssh/config || echo "No SSH config found"
+          echo ""
+          echo "SSH key permissions:"
+          ls -la /root/.ssh/
+          echo ""
+          echo "Known hosts:"
+          cat /root/.ssh/known_hosts || echo "No known hosts found"
+          echo ""
+          echo "Current user: $(whoami)"
+          echo "HOME variable: $HOME"
+          
+      - name: Test SSH connection
+        run: |
+          echo "Testing SSH connection to AUR..."
+          # Set SSH agent environment
+          eval "$(ssh-agent -s)"
+          ssh-add /root/.ssh/id_ed25519
+          
+          # Test connection with verbose output
+          ssh -T -v aur@aur.archlinux.org -o ConnectTimeout=30 -o StrictHostKeyChecking=yes 2>&1 || echo "SSH test completed (exit code: $?)"
+          
+      - name: Publish to AUR
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -e
+          
+          # Setup SSH agent for this step
+          eval "$(ssh-agent -s)"
+          ssh-add /root/.ssh/id_ed25519
+          
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          
+          # Function to retry git operations
+          retry_git() {
+            local max_attempts=3
+            local delay=5
+            local attempt=1
+            
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt of $max_attempts..."
+              if "$@"; then
+                echo "Success on attempt $attempt"
+                return 0
+              else
+                echo "Failed attempt $attempt"
+                if [ $attempt -lt $max_attempts ]; then
+                  echo "Waiting $delay seconds before retry..."
+                  sleep $delay
+                  delay=$((delay * 2))  # Exponential backoff
+                fi
+                attempt=$((attempt + 1))
+              fi
+            done
+            
+            echo "All attempts failed"
+            return 1
+          }
+          
+          # Clone AUR repository with retry
+          echo "Cloning AUR repository..."
+          retry_git git clone ssh://aur@aur.archlinux.org/td-tui.git aur-repo
+          
+          # Copy files
+          cp PKGBUILD aur-repo/
+          cp .SRCINFO aur-repo/
+          cd aur-repo
+          
+          # Check if there are any changes
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes detected, skipping push"
+            exit 0
+          fi
+          
+          # Add and commit changes
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to version ${VERSION}"
+          
+          # Push with retry
+          echo "Pushing changes..."
+          retry_git git push origin master
